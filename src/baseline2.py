@@ -33,9 +33,9 @@ def convert_one_line(text_a, text_b, tokenizer=None):
     tokens_a = tokenizer.tokenize(text_a)
     tokens_b = tokenizer.tokenize(text_b)
     one_token = tokenizer.convert_tokens_to_ids(
-        ["[CLS]"] + tokens_a + ["[SEP]"]+tokens_b)
+        ["[CLS]"] + tokens_a + ["[SEP]"] + tokens_b)
     token_type = np.zeros(len(one_token))
-    token_type[-len(tokens_b):]=1
+    token_type[-len(tokens_b):] = 1
     return one_token, token_type
 
 
@@ -102,6 +102,7 @@ def main():
     arg('--limit', type=int)
     arg('--fold', type=int, default=0)
     arg('--multi-gpu', type=int, default=0)
+    arg('--lr_layerdecay', type=float, default=0.95)
     args = parser.parse_args()
 
     set_seed()
@@ -135,16 +136,28 @@ def main():
         model = PairModel(BERT_PRETRAIN_PATH)
         model.cuda()
 
-        param_optimizer = list(model.named_parameters())
-        no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
+        # param_optimizer = list(model.named_parameters())
+        # no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
+        # optimizer_grouped_parameters = [
+        #     {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay) and p.requires_grad],
+        #      'weight_decay': 0.01},
+        #     {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay) and p.requires_grad],
+        #      'weight_decay': 0.0}
+        # ]
+        NUM_LAYERS = 12
         optimizer_grouped_parameters = [
-            {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay) and p.requires_grad],
-             'weight_decay': 0.01},
-            {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay) and p.requires_grad],
-             'weight_decay': 0.0}
+            {'params': model.bert.bert.embeddings.parameters(), 'lr': args.lr * (args.lr_layerdecay ** NUM_LAYERS)},
+            {'params': model.head.parameters(), 'lr': args.lr},
+            {'params': model.bert.bert.pooler.parameters(), 'lr': args.lr}
         ]
+
+        for layer in range(NUM_LAYERS):
+            optimizer_grouped_parameters.append(
+                {'params': model.bert.bert.encoder.layer.__getattr__('%d' % (NUM_LAYERS - 1 - layer)).parameters(),
+                 'lr': args.lr * (args.lr_layerdecay ** layer)},
+            )
         optimizer = BertAdam(optimizer_grouped_parameters, lr=args.lr, warmup=0.05,
-                             t_total=len(training_loader)*args.n_epochs // args.step)
+                             t_total=len(training_loader) * args.n_epochs // args.step)
 
         model, optimizer = amp.initialize(model, optimizer, opt_level="O2", verbosity=0)
         optimizer.zero_grad()
@@ -154,11 +167,11 @@ def main():
 
         train(args, model, optimizer, None,
               train_loader=training_loader,
-              valid_df = valid_fold,
+              valid_df=valid_fold,
               valid_loader=valid_loader, epoch_length=len(training_set))
 
     elif args.mode == 'validate':
-        valid_fold = pd.read_table('../byebyejuly/dev.txt', names=['a', 'b', 'label'])
+        valid_fold = pd.read_table('../byebyejuly/test.txt', names=['a', 'b', 'label'])
 
         valid_set = TrainDataset(valid_fold)
         valid_loader = DataLoader(valid_set, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn,
@@ -215,7 +228,7 @@ def train(args, model: nn.Module, optimizer, scheduler, *,
             inputs, token_types, targets = inputs.cuda(), token_types.cuda(), targets.cuda()
 
             outputs = model(inputs, token_types, masks)
-            loss = loss_fn(outputs, targets.view(-1,1)) / args.step
+            loss = loss_fn(outputs, targets.view(-1, 1)) / args.step
             batch_size = inputs.size(0)
 
             # loss.backward()
@@ -284,7 +297,6 @@ def validation(model: nn.Module, valid_df, valid_loader, args, save_result=False
 
     all_predictions = np.concatenate(all_predictions)
 
-
     all_targets = np.concatenate(all_targets)
 
     if save_result:
@@ -293,7 +305,7 @@ def validation(model: nn.Module, valid_df, valid_loader, args, save_result=False
 
     metrics = dict()
     metrics['loss'] = np.mean(all_losses)
-    metrics['acc'] = accuracy_score(all_targets, all_predictions>0.5)
+    metrics['acc'] = accuracy_score(all_targets, all_predictions > 0.5)
     metrics['auc'] = roc_auc_score(all_targets, all_predictions)
     to_print = []
     for idx, (k, v) in enumerate(sorted(metrics.items(), key=lambda kv: -kv[1])):
